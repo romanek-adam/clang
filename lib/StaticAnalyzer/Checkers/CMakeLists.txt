@@ -26,9 +26,11 @@ add_clang_library(clangStaticAnalyzerCheckers
   ClangCheckers.cpp
   CloneChecker.cpp
   ConversionChecker.cpp
+  CppcheckDefinitionsParser.cpp
   CXXSelfAssignmentChecker.cpp
   DeadStoresChecker.cpp
   DebugCheckers.cpp
+  DeclarativeFunctionClassifier.cpp
   DeleteWithNonVirtualDtorChecker.cpp
   DereferenceChecker.cpp
   DirectIvarAssignment.cpp
@@ -112,3 +114,8 @@ add_clang_library(clangStaticAnalyzerCheckers
   clangLex
   clangStaticAnalyzerCore
   )
+
+if (CLANG_HAVE_LIBXML)
+  target_link_libraries(clangStaticAnalyzerCheckers PRIVATE ${LIBXML2_LIBRARIES})
+endif()
+

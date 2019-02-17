@@ -13,6 +13,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangSACheckers.h"
+#include "CppcheckDefinitionsParser.h"
+#include "DeclarativeFunctionClassifier.h"
 #include "InterCheckerAPI.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/ParentMap.h"
@@ -22,6 +24,7 @@
 #include "clang/StaticAnalyzer/Core/BugReporter/CommonBugCategories.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
+#include "clang/StaticAnalyzer/Core/CheckerRegistry.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
@@ -30,6 +33,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/Debug.h"
 #include "AllocationState.h"
 #include <climits>
 #include <utility>
@@ -47,7 +51,8 @@ enum AllocationFamily {
   AF_CXXNewArray,
   AF_IfNameIndex,
   AF_Alloca,
-  AF_InnerBuffer
+  AF_InnerBuffer,
+  AF_GenericAcquireRelease
 };
 
 class RefState {
@@ -207,6 +212,8 @@ public:
   DefaultBool ChecksEnabled[CK_NumCheckKinds];
   CheckName CheckNames[CK_NumCheckKinds];
 
+  void init(clang::ento::CheckerManager &Mgr);
+
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostStmt(const CallExpr *CE, CheckerContext &C) const;
   void checkPostStmt(const CXXNewExpr *NE, CheckerContext &C) const;
@@ -255,6 +262,7 @@ private:
                          *II_g_try_malloc_n, *II_g_try_malloc0_n,
                          *II_g_try_realloc_n;
   mutable Optional<uint64_t> KernelZeroFlagVal;
+  mutable DeclarativeFunctionClassifier DeclFuncClassifier;
 
   void initIdentifierInfo(ASTContext &C) const;
 
@@ -273,7 +281,8 @@ private:
                               const Expr *DeallocExpr) const;
   /// Print expected name of a deallocator based on the allocator's
   /// family.
-  void printExpectedDeallocName(raw_ostream &os, AllocationFamily Family) const;
+  void printExpectedDeallocName(raw_ostream &os, AllocationFamily Family,
+                                const Expr *AllocExpr) const;
 
   ///@{
   /// Check if this is one of the functions which can allocate/reallocate memory
@@ -580,6 +589,23 @@ public:
 };
 } // end anonymous namespace
 
+void MallocChecker::init(clang::ento::CheckerManager &Mgr) {
+  if (ChecksEnabled[MallocChecker::CK_MallocChecker]) {
+    auto Paths =
+        Mgr.getAnalyzerOptions()
+               .getOptionAsString("DeclarativeFunctionDefinitionsPaths", "");
+    llvm::ExitOnError ExitOnErr{"error loading definitions: "};
+    ExitOnErr(DeclFuncClassifier.loadDefinitions(Paths, [&](StringRef Text) {
+        CppcheckDefinitionsParser Parser;
+        ExitOnErr(Parser.parse(
+            Text,
+            [this](DeclarativeFunctionClassifier::ResourceFuncFamily Family) {
+                DeclFuncClassifier.addResourceFuncFamily(std::move(Family));
+        }));
+    }));
+  }
+}
+
 void MallocChecker::initIdentifierInfo(ASTContext &Ctx) const {
   if (II_malloc)
     return;
@@ -617,6 +643,8 @@ void MallocChecker::initIdentifierInfo(ASTContext &Ctx) const {
   II_g_try_malloc_n = &Ctx.Idents.get("g_try_malloc_n");
   II_g_try_malloc0_n = &Ctx.Idents.get("g_try_malloc0_n");
   II_g_try_realloc_n = &Ctx.Idents.get("g_try_realloc_n");
+
+  DeclFuncClassifier.identifierInit(Ctx);
 }
 
 bool MallocChecker::isMemFunction(const FunctionDecl *FD, ASTContext &C) const {
@@ -628,6 +656,10 @@ bool MallocChecker::isMemFunction(const FunctionDecl *FD, ASTContext &C) const {
 
   if (isCMemFunction(FD, C, AF_Alloca, MemoryOperationKind::MOK_Any))
     return true;
+
+  if (isCMemFunction(FD, C, AF_GenericAcquireRelease, MemoryOperationKind::MOK_Any)) {
+    return true;
+  }
 
   if (isStandardNewDelete(FD, C))
     return true;
@@ -685,6 +717,16 @@ bool MallocChecker::isCMemFunction(const FunctionDecl *FD,
     if (Family == AF_Alloca && CheckAlloc) {
       if (FunI == II_alloca || FunI == II_win_alloca)
         return true;
+    }
+
+    if (Family == AF_GenericAcquireRelease) {
+      auto FuncInfo = DeclFuncClassifier.getFuncInfo(FunI);
+      if (CheckAlloc && FuncInfo == DeclarativeFunctionClassifier::FuncInfo::ACQUIRE) {
+        return true;
+      }
+      if (CheckFree && FuncInfo == DeclarativeFunctionClassifier::FuncInfo::RELEASE) {
+        return true;
+      }
     }
   }
 
@@ -955,6 +997,15 @@ void MallocChecker::checkPostStmt(const CallExpr *CE, CheckerContext &C) const {
       State = ReallocMemAux(C, CE, false, State, true);
       State = ProcessZeroAllocation(C, CE, 1, State);
       State = ProcessZeroAllocation(C, CE, 2, State);
+    } else {
+      auto FuncInfo = DeclFuncClassifier.getFuncInfo(FunI);
+      if (FuncInfo == DeclarativeFunctionClassifier::FuncInfo::ACQUIRE) {
+        State = MallocMemAux(C, CE, UnknownVal(), UnknownVal(), State,
+                             AF_GenericAcquireRelease);
+      }
+      if (FuncInfo == DeclarativeFunctionClassifier::FuncInfo::RELEASE) {
+        State = FreeMemAux(C, CE, State, 0, false, ReleasedAllocatedMemory);
+      }
     }
   }
 
@@ -1409,6 +1460,9 @@ AllocationFamily MallocChecker::getAllocationFamily(CheckerContext &C,
     if (isCMemFunction(FD, Ctx, AF_Alloca, MemoryOperationKind::MOK_Any))
       return AF_Alloca;
 
+    if (isCMemFunction(FD, Ctx, AF_GenericAcquireRelease, MemoryOperationKind::MOK_Any))
+      return AF_GenericAcquireRelease;
+
     return AF_None;
   }
 
@@ -1474,19 +1528,45 @@ void MallocChecker::printExpectedAllocName(raw_ostream &os, CheckerContext &C,
     case AF_CXXNewArray: os << "'new[]'"; return;
     case AF_IfNameIndex: os << "'if_nameindex()'"; return;
     case AF_InnerBuffer: os << "container-specific allocator"; return;
+    case AF_GenericAcquireRelease: os << "generic-acquire"; return;
     case AF_Alloca:
     case AF_None: llvm_unreachable("not a deallocation expression");
   }
 }
 
 void MallocChecker::printExpectedDeallocName(raw_ostream &os,
-                                             AllocationFamily Family) const {
+                                             AllocationFamily Family,
+                                             const Expr *AllocExpr) const {
   switch(Family) {
     case AF_Malloc: os << "free()"; return;
     case AF_CXXNew: os << "'delete'"; return;
     case AF_CXXNewArray: os << "'delete[]'"; return;
     case AF_IfNameIndex: os << "'if_freenameindex()'"; return;
     case AF_InnerBuffer: os << "container-specific deallocator"; return;
+    case AF_GenericAcquireRelease: {
+      if (const CallExpr *CE = dyn_cast<CallExpr>(AllocExpr)) {
+        const FunctionDecl *FD = CE->getDirectCallee();
+        if (!FD) {
+          os << "(unknown)";
+          return;
+        }
+
+        const IdentifierInfo *AllocFunI = FD->getIdentifier();
+        if (!AllocFunI) {
+          os << "(unknown)";
+          return;
+        }
+
+        auto *FuncFamily = DeclFuncClassifier.getFamily(AllocFunI);
+        if (!FuncFamily) {
+          os << "(unknown)";
+          return;
+        }
+
+        os << FuncFamily->ReleaseName << "()";
+        return;
+      }
+    }
     case AF_Alloca:
     case AF_None: llvm_unreachable("suspicious argument");
   }
@@ -1654,7 +1734,8 @@ MallocChecker::getCheckIfTracked(AllocationFamily Family,
   switch (Family) {
   case AF_Malloc:
   case AF_Alloca:
-  case AF_IfNameIndex: {
+  case AF_IfNameIndex:
+  case AF_GenericAcquireRelease: {
     if (ChecksEnabled[CK_MallocChecker])
       return CK_MallocChecker;
 
@@ -1900,7 +1981,7 @@ void MallocChecker::ReportMismatchedDealloc(CheckerContext &C,
         os << " allocated by " << AllocOs.str();
 
       os << " should be deallocated by ";
-        printExpectedDeallocName(os, RS->getAllocationFamily());
+        printExpectedDeallocName(os, RS->getAllocationFamily(), AllocExpr);
 
       if (printAllocDeallocName(DeallocOs, C, DeallocExpr))
         os << ", not " << DeallocOs.str();
@@ -2423,6 +2504,8 @@ void MallocChecker::checkPreCall(const CallEvent &Call,
     if (ChecksEnabled[CK_MallocChecker] &&
         (isCMemFunction(FD, Ctx, AF_Malloc, MemoryOperationKind::MOK_Free) ||
          isCMemFunction(FD, Ctx, AF_IfNameIndex,
+                        MemoryOperationKind::MOK_Free) ||
+         isCMemFunction(FD, Ctx, AF_GenericAcquireRelease,
                         MemoryOperationKind::MOK_Free)))
       return;
 
@@ -2917,6 +3000,7 @@ std::shared_ptr<PathDiagnosticPiece> MallocChecker::MallocBugVisitor::VisitNode(
         case AF_CXXNew:
         case AF_CXXNewArray:
         case AF_IfNameIndex:
+        case AF_GenericAcquireRelease:
           Msg = "Memory is released";
           break;
         case AF_InnerBuffer: {
@@ -3095,6 +3179,7 @@ void ento::registerNewDeleteLeaksChecker(CheckerManager &mgr) {
         "Optimistic", false, checker);                                         \
     checker->ChecksEnabled[MallocChecker::CK_##name] = true;                   \
     checker->CheckNames[MallocChecker::CK_##name] = mgr.getCurrentCheckName(); \
+    checker->init(mgr);                                                        \
   }
 
 REGISTER_CHECKER(MallocChecker)
